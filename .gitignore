@@ -9,6 +9,8 @@ ref/
 # 本地凭证（插件把凭证写在 DSH_HOME 下，这里仅作防御性忽略）
 web-login/
 deepseek-auth.json
+# 启动器的「粘贴不灵」退路：把 token 存成这个文件（它是可登录凭证，绝不许入库）
+ds-token.txt
 .env
 .env.*
 

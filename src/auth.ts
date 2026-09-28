@@ -244,9 +244,17 @@ export function staleAuthRecord(
  *  - 未登录时网页端返回的是 `{"value":null,"__version":"0"}` → 必须得到**空串**，
  *    绝不能把字符串 "null" 当 token（否则会拿垃圾 token 去请求，报 40003 让人一头雾水）。
  *  - 旧版本网页端存的是裸 token 字符串 → 原样返回。
+ *
+ * ⚠️ 第三个（2026-09-28 用户现场）：从控制台/记事本复制时常**连着引号一起**存进来
+ * （`'<token>'`、`"<token>"`）。带引号发出去，服务端回的是
+ * `Authorization Failed (invalid token)` —— 和"token 过期"长得一模一样，
+ * 用户会以为要重新登录，其实只是多了两个字符。这里统一剥掉**成对的首尾引号**。
+ * （token 本身是字母数字串，不会以引号开头结尾，剥错的风险可以忽略。）
  */
 export function unwrapStoredToken(raw: unknown): string {
-  const text = String(raw ?? '').trim()
+  let text = String(raw ?? '').trim()
+  const quoted = /^(['"`])([\s\S]*)\1$/.exec(text)
+  if (quoted) text = quoted[2].trim()
   if (!text) return ''
   if (text.startsWith('{')) {
     try {
@@ -256,6 +264,13 @@ export function unwrapStoredToken(raw: unknown): string {
       return ''
     }
   }
+  // ⚠️ 第四个（2026-09-28 现场）：把**整句提示文案**连中文括号一起复制进来 ——
+  // `JSON.parse(localStorage.getItem('userToken')).value）` 这种。整串发给服务端只会回
+  // 40003 invalid token，用户看到的现象和"token 过期"一模一样。
+  // 只在"整串本来就不像 token"时，抠出**唯一一段** 40 位以上的 token 字符；
+  // 抠出两段（说明粘贴内容不干净）或抠不出，就维持原样交出去 —— 宁可报错，也不瞎猜。
+  const runs = text.match(/[A-Za-z0-9_-]{40,}/g)
+  if (runs && runs.length === 1) return runs[0]
   // 兜底：字面量 "null"/"undefined" 一律视为空
   return text === 'null' || text === 'undefined' ? '' : text
 }

@@ -212,6 +212,49 @@ await test('F2：请求 AUTH + 复核探活也失败 ⇒ 确认失效，照旧�
     const r = listAccounts().find((item) => item.token === AUTH.token)
     return r?.lastVerifyError !== undefined
   }, '复核确认失效并标记')
+  // ⚠️ 反向验证：把 index.ts 里 `verdict.error ?? …` 改回只存 `info.message` → 这条红。
+  //    现场（2026-09-28）：存进去的那条文案已经嵌了上一次的同类文案 ⇒ 每失败一轮就套一层
+  //    「这个账号的登录态已失效（这个账号的登录态已失效（…）」，几轮之后日志完全没法读。
+  const marked = listAccounts().find((item) => item.token === AUTH.token)
+  assert.ok(
+    // 留的是**复核那一步**给出的短原因：真机上通常是服务端信封的
+    // `Authorization Failed (invalid token)`；本用例的假服务端回的是 HTTP 401。
+    /users\/current|Authorization Failed/.test(String(marked?.lastVerifyError?.message ?? '')),
+    `要留复核给出的短原因，实际：${marked?.lastVerifyError?.message}`,
+  )
+  assert.ok(String(marked?.lastVerifyError?.message ?? '').length <= 120, '而且必须短 —— 长了就说明又把外层文案抄进去了')
+  assert.ok(
+    !String(marked?.lastVerifyError?.message ?? '').includes('这个账号的登录态已失效'),
+    '不得把外层包装文案存进去（那就是嵌套增长的源头）',
+  )
+})
+
+await test('F2：连续被判 AUTH ⇒ 标记文案不增长（不会一层套一层）', async () => {
+  writeAuth(AUTH)
+  upsertAccount({ ...AUTH, id: 'acc_F2c' })
+  currentHits = 0
+  const adapter = await bootAdapter()
+  setFetchImpl(async (input) => {
+    const url = String(input)
+    if (url.includes('chat_session/create')) {
+      return new Response(JSON.stringify({ code: 0, data: { biz_data: { id: 's-1' } } }), { status: 200 })
+    }
+    if (url.includes(CHALLENGE_URL)) {
+      return new Response(JSON.stringify({ code: 40003, msg: 'Authorization Failed (invalid token)' }), { status: 200 })
+    }
+    if (url.includes(CURRENT_URL)) return new Response('unauthorized', { status: 401 })
+    return new Response('not found', { status: 404 })
+  })
+  const readMessage = () => String(listAccounts().find((item) => item.token === AUTH.token)?.lastVerifyError?.message ?? '')
+  await driveOneAuthRound(adapter)
+  await waitFor(() => readMessage() !== '', '第一次标记落地')
+  const first = readMessage()
+  // 第二次：账号已被标记失效 ⇒ 请求会被"跳过"路径直接拦下，仍应再走一次复核并保持文案不变
+  await driveOneAuthRound(adapter)
+  await waitFor(() => readMessage() !== '', '第二次标记落地')
+  const second = readMessage()
+  assert.ok(second.length <= first.length + 5, `文案不该增长：第一次 ${first.length} 字、第二次 ${second.length} 字（${second.slice(0, 80)}…）`)
+  assert.ok(!second.includes('（这个账号的登录态已失效'), '不得出现自嵌套')
 })
 
 console.log()

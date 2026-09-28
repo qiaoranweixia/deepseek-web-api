@@ -186,6 +186,96 @@ completion all succeed. Switch to browser login if you ever hit frequent `AUTH` 
 
 If they are lost, **Recover from the logged-in window** reuses the persistent partition — no re-login needed.
 
+## Local endpoint: for software other than DSH (OpenAI-compatible)
+
+Anything that speaks the OpenAI API (Chatbox, Cherry Studio, Cline, your own scripts…) can use the same
+web-session channel: while the plugin runs, it serves a small HTTP endpoint **bound to localhost only**.
+
+| What to fill in | Value |
+|---|---|
+| Base URL | `http://127.0.0.1:8788/v1` |
+| API key | leave empty (an optional key exists, see below) |
+| Model | `deepseek-chat` (no thinking) / `deepseek-reasoner` (thinking) |
+
+The actual port is in the plugin's startup log (default 8788; if it is taken, the next ten ports are tried).
+`http://127.0.0.1:8788/healthz` answers `ok: true` while it is alive. Streaming (`stream: true`), tool calls
+(function calling) and `reasoning_content` are supported.
+
+### One port doubles as the control panel
+
+Open **`http://127.0.0.1:8788/`** — the same port serves a small web console for the endpoint: account
+(paste a token to log in / log out), **session cleanup** (delete now / batched / **keep**), context feeding
+(full / chained), throttling (gap range, concurrency), the endpoint itself (on-off, port, key) and today's
+usage. Changes apply immediately and write the **same settings** the DSH panel uses
+(`gate.json` / `context-mode.json` / `api-server.json`), so the two can never disagree.
+
+> It simply reuses the DSH panel's API (`/deepseek-web-login/api/*`): one implementation, two entrances.
+> With a local key set, open the console as `http://127.0.0.1:8788/?key=<your-key>`.
+
+> Whether it starts on its own depends on how the plugin was installed: **bundle installs
+> (`dsh plugin add`) have it on** (`cordis.patch.yml` sets `apiServer: { enabled: true }`); runtime
+> injection (`dev_inject_plugin`) does not read that file, so pass `apiServer: { enabled: true }` yourself.
+> The startup log prints the actual address — no line means it is off.
+
+> ⚠️ It is the **same path**, not a second one: same request gate (serial by default, 2–4 s randomised gap),
+> same account pool, same retry / account-rotation, same session cleaner. Requests from external software
+> therefore **queue behind** DSH's own — connecting a second app does not bring back the "two concurrent
+> generations on one account" pattern that gets accounts limited. To use it while DSH is closed, see the
+> standalone launcher below (same accounts, same settings, different process).
+
+### Standalone launcher (no DSH)
+
+```bat
+:: Windows: double-click, in the repo root
+start-api.cmd
+```
+
+**Never logged in yet?** Double-click `login-and-start.cmd` instead: it opens chat.deepseek.com in your
+**everyday browser** (already signed in on Edge/Chrome? perfect), asks you to run one line in the F12 console
+and paste the result back (no echo), then starts the endpoint — afterwards plain `start-api.cmd` is enough.
+
+```bash
+# any platform
+node scripts/serve.mjs            # same as npm run api
+node scripts/serve.mjs --enable   # flip enabled:false in the config, then start
+node scripts/serve.mjs --login    # opens the browser and walks you through the token paste, then starts
+```
+
+The window prints the exact value to paste into your client (`http://127.0.0.1:8788/v1`). It just runs the
+host bundle as a plain Node program, so the gate, account library, session cleaner, ledger and login probe
+are the **same implementation**. Things worth knowing up front:
+
+- **Logging in** (once; both routes write the same account library): ① already signed in on your everyday
+  browser → `login-and-start.cmd`, or in the panel use "log in with my default browser", then run
+  `JSON.parse(localStorage.getItem('userToken')).value` in F12 → Console and paste the printed value;
+  ② no DSH at all → pass the same value via `--token <userToken>` (`--cookie "name=value; …"` optional).
+  ⚠️ Your everyday browser session is **not** imported automatically — the plugin deliberately uses its own
+  profile and never reads your daily Edge cookies — so the one-time token paste is the price. A token alone
+  (no `x-hif-*` fingerprint headers) is verified to work for validation, PoW and generation; if `AUTH` /
+  `40003` ever become frequent, log in through the panel's browser window to capture the headers too.
+  Without credentials the window says "当前账号：未登录" and requests return `503 MISSING_CREDENTIAL`.
+- **Transport degrades to node**: a standalone process cannot use Electron's `net.fetch` (Chromium network
+  stack), so the fingerprint is weaker than running inside DSH. For heavy long-term use, prefer DSH.
+- **Don't run DSH against the same account at the same time**: the gate is per process, so both sides keep
+  their own queue and could overlap generations on one account. Use one side, or use different accounts.
+- **Never starts a second copy**: it probes the port first and exits with the address if our endpoint is
+  already up (usually the DSH plugin).
+- Keep the window open (Ctrl+C stops). Closing it stops the endpoint.
+
+**Keep or delete the web conversation:** every call creates/reuses a web chat session, and whether it is
+deleted follows the settings panel's **Anti-detection → session cleanup** policy (`immediate` / batched
+`deferred` (default) / `keep`) — external software shares that single switch. Clients that allow custom
+request bodies can also override it per request with a non-standard field:
+`{"keep_conversation": true}` (keep this one) or `{"keep_conversation": false}` (delete it even when the
+global policy is `keep`). With `keep` plus chained context feeding, the web side keeps a real conversation
+you can continue in the browser.
+
+**Security and how to turn it off:** localhost-only; no CORS headers and `application/json` bodies only, so
+drive-by web pages cannot use it. An optional local key goes in `~/.dsh/web-login/api-server.json`
+(`{"key": "..."}`, then clients send `Authorization: Bearer <key>`). Disable with `{"enabled": false}` in that
+file, or `apiServer: { enabled: false }` in the plugin config. Not supported yet: image input (an incoming
+image is replaced by a placeholder sentence rather than silently dropped) and Anthropic's `/v1/messages`.
+
 ## Models
 
 Taken from the account's own server config (`GET /api/v0/client/settings?scope=model` → `model_configs`,
@@ -211,6 +301,7 @@ Context (verified field by field on 2026-09-11 via `GET /api/v0/client/settings?
 
 | Field | Default | Meaning |
 |---|---|---|
+| `apiServer` | `{ enabled: false, port: 8788, key: '' }` (`true` for bundle installs, see above) | Local OpenAI-compatible endpoint. Localhost only; `enabled: false` turns it off. Values saved in the panel / `api-server.json` win over this one |
 | `maxPromptChars` | `400000` | Prompt character budget (excess is middle-truncated, keeping the system prompt, the tool protocol and the most recent turns). ⚠️ **Raising it clearly increases the risk of being rate-limited**; range `[120000, 1500000]`, and the default is deliberately **not** at the ceiling |
 | `maxRefImages` | `24` | How many images one request may carry (`ref_file_ids` length). The web endpoint caps that batch (measured: 40 pass, 52 rejected); going over rejects the **whole turn**, and then **every later turn in that conversation fails** because the images stay in the history. So only the most recent N are sent; skipped ones are marked `[earlier image omitted]` in the prompt. `0` = unlimited (**not recommended**). ⚠️ That "N images" is really **N image-content entries**: every `read_image` by the model, and every re-render / crop that changes the bytes, adds one — so it is usually far more than the number of images you pasted yourself. Since 0.1.79 the notice says "N image-content entries". Since 0.1.81 it is shown on a **ladder** instead: always the first time, then only once the number of skipped entries has doubled (and grown by at least 10) — 0.1.79's "only once per identical trim size" was not enough, because that signature contained the growing total. So it is O(log n) notices per conversation rather than one per turn |
 | `idleTimeoutMs` | `120000` | SSE idle timeout |

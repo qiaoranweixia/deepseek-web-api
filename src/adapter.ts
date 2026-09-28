@@ -667,6 +667,23 @@ function allowsAutoContinue(purpose: unknown): boolean {
 }
 
 /**
+ * 这一次调用结束后，临时网页端会话要不要删。
+ *
+ * 默认跟全局配置（`deleteWebSessions`，由设置页的「会话清理」策略决定）；
+ * 本地接口（api-server.ts）另给了**单次请求**的覆盖开关：
+ *   `__keepSession: true`   —— 这轮别删（想在网页端看到/接着聊这次对话）
+ *   `__deleteSession: true` —— 这轮删（即使全局设成了「不删」）
+ *
+ * 放在这里而不是调用方：删与不删只有**一个**决策点，两条路径（DSH 内 / 本地接口）
+ * 必须同答 —— 否则会出现"同一份设置，从哪儿调决定删不删"。
+ */
+function deletesWebSession(options: any, config: AdapterConfig): boolean {
+  if (options?.__keepSession === true) return false
+  if (options?.__deleteSession === true) return true
+  return config.deleteWebSessions !== false
+}
+
+/**
  * 交给 dsh-llm 的**重试策略**（`LlmAdapter.providerRetryPolicy` 的返回值）。
  *
  * 🔴 为什么必须显式声明、**不能返回 undefined**：不声明就用 dsh-llm 的默认策略，其中
@@ -1323,7 +1340,7 @@ export function createAdapter(deps: AdapterDeps) {
         // 会话复用：同一账号连续多个回合共用一个网页端会话（见 webapi.ts 的实测判定）
         ...(deps.config.sessionReuseTurns !== undefined ? { sessionReuseTurns: deps.config.sessionReuseTurns } : {}),
         onDeleteSession:
-          deps.config.deleteWebSessions === false
+          !deletesWebSession(options, deps.config)
             ? undefined
             : (sessionId: string) => {
                 // 清理策略由宿主注入（攒批 / 立即 / 不删），缺省退回老行为

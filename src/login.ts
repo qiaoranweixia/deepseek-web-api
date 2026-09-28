@@ -828,6 +828,17 @@ export async function loginWithToken(
   }
   const trimmed = unwrapStoredToken(token) || raw
   if (trimmed.length < 8) return { ok: false, error: 'token 太短，请确认复制的是 chat.deepseek.com 的登录 token' }
+  // ⚠️ 第五个（2026-09-28 现场）：粘贴的是**说明文字/命令整行**（带空格、中文、换行、括号）。
+  // 真正的 userToken 只有 ASCII 字母数字加 `-_.`，一有空白或非 ASCII 就绝不可能是 token；
+  // 放过去只会落一个"校验不过"的垃圾账号（用户账号库里因此堆过 3 条 264/396/660 字的记录）。
+  if (!/^[\x21-\x7E]+$/.test(trimmed)) {
+    return {
+      ok: false,
+      error:
+        '粘贴的内容里有空格/中文/换行，不像是 token —— 请只复制 F12 控制台**打印出来的那一串**' +
+        '（那行命令本身不是 token；它执行后的输出才是）',
+    }
+  }
   const auth: WebAuth = {
     token: trimmed,
     cookie: String(cookie ?? '').trim(),

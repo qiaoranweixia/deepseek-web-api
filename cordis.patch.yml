@@ -1,6 +1,12 @@
 # DSH bundle 装配层：走官方装配（dsh plugin add / dev_install_package）时插入本插件。
 # 运行时注入（dev_inject_plugin）不读本文件。
+#
+# apiServer：本地 OpenAI 兼容接口（给 DSH 之外的软件用）。**这里显式开**：
+#   代码里的默认是关（裸 apply() 不该凭空开监听端口），装出来的插件要"填上地址就能用"。
+#   关掉它 / 换端口 / 加本地 key：改这里，或写 ~/.dsh/web-login/api-server.json（优先级更高）。
 - insert:
     - id: dsh-deepseek-web-login
       name: dsh-deepseek-web-login
-      config: {}
+      config:
+        apiServer:
+          enabled: true

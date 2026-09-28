@@ -2,6 +2,98 @@
 
 本项目遵循大致语义化版本；日期为本地时间。
 
+## 0.7.0 — 2026-09-28
+
+> 把网页端通道**借给别的软件**：插件进程里多了一个本地 OpenAI 兼容接口。
+
+### 新增
+
+- **本地接口**（`src/api-server.ts`，默认开、只监听 `127.0.0.1`）：
+  - `GET /v1/models` → `deepseek-chat` / `deepseek-reasoner`
+  - `POST /v1/chat/completions` → 流式与非流式、工具调用（function calling）、
+    `reasoning_content`（思考档的推理流）
+  - 端口默认 **8788**，被占用自动顺延（最多再试 9 个）；实际端口进启动日志，
+    `GET /healthz` 可自查
+  - 设置落盘 `~/.dsh/web-login/api-server.json`（`enabled` / `port` / `key`）；
+    host 路由 `GET|POST /deepseek-web-login/api/api-server` 读写同一份设置，改完**立即重绑**
+- **对话删 / 不删**：接口每次调用建的网页端临时会话，删不删跟设置页「会话清理」同一个开关
+  （`immediate` / `deferred` / `keep`）；客户端还能按次覆盖 —— body 里加非标准字段
+  `"keep_conversation": true|false`（`adapter.ts` 里 `deletesWebSession` 是唯一决策点）。
+- **独立启动器**（`scripts/serve.mjs` + 双击用的 `start-api.cmd` / `npm run api`）：
+  **不开 DSH** 也能把接口跑起来。它把宿主包 `lib/index.js` 当普通 Node 程序跑 ——
+  闸门、账号库、会话清理、台账、探活还是同一份实现，不存在第二条请求路径；
+  启动时先探端口（DSH 里已经开着就直接打印地址退出，不会起第二个），等 `/healthz` 真能应答
+  才宣布就绪，Ctrl+C 收尾时把待删会话交回清理器。
+  另外给了 `--token <userToken>`（`--cookie` 可选）这条**没有 DSH 面板也能登录**的路 ——
+  用的就是面板「手动粘贴 Token」那条纯 Node 路径（校验 + 落库，不碰 Electron），
+  于是「装 Node → 启动器里贴 token → 客户端填三行」可以完全不依赖 DSH。
+  再加 `--login`（和双击用的 `login-and-start.cmd`）：先用**日常浏览器**打开 chat.deepseek.com
+  （Edge 上已登录就是现成的）、提示 F12 取 token 的那行命令、把粘贴内容**不回显**地收进来 ——
+  「一直登在 Edge 上」的人因此只需要粘一次，不用去插件窗口里重新登一遍。
+  实测反馈补两点：不回显会让"粘上了"和"没粘上"看起来一样 ⇒ 现在回车后打印
+  `收到 N 个字符`，提示里写明 Ctrl+V 没反应就**右键粘贴**；另外新增 `--token-file <路径>`
+  （`login-and-start.cmd` 也会自动改读同目录的 `ds-token.txt`），彻底绕开控制台粘贴。
+  测试里用 `DSWL_NO_BROWSER=1` 关掉真弹窗；Windows 上改用 `rundll32 url.dll,FileProtocolHandler`
+  打开浏览器（走 `cmd /c start` 会多留一个 cmd 进程挂在浏览器上，实测）。
+  两点代价写在启动横幅与 README 里：传输层退化到 node（拿不到 Electron 网络栈），
+  以及「别和 DSH 同时用同一账号跑任务」（闸门是进程内的）。
+- **一个端口就是控制台**：本地接口自带网页控制台（`http://127.0.0.1:<端口>/`）——
+  账号（粘贴 token 登录 / 退出）、会话清理（立即删 / 攒批删 / 不删）、上下文投喂（全量 / 链式）、
+  请求节流（间隔区间 + 并发开关）、接口自己（开关 / 端口 / key）、今天用量，改完即时生效。
+  实现是**复用 DSH 面板那套 host API**（`/deepseek-web-login/api/*` 挂到本地端口上），
+  所以不存在两套路由漂移；`index.ts` 里为此只动了三行（把已注册的 handler 存了个引用）。
+  安全上沿袭本地接口那套：只监听本机、不发 CORS、管理类 POST 只收 `application/json`
+  （挡住网页跨站 simple request）；设了 key 时页面用 `?key=` 打开，API 仍只认请求头；
+  `/healthz` 不校验 key（否则启动器判断不了"是不是已经在跑"）。
+
+### 关键取舍（改之前先读这段）
+
+- **复用同一个 adapter 实例**，不另起一条请求路径：闸门（串行 + 随机间隔）、自动换号、
+  请求前的失效拦截、会话清理、重试策略全在适配器里 —— 两条路径迟早会答得不一样。
+  直接后果是外部软件与 DSH **排队**而不是并发（并发同账号正是封号那件事的触发姿势）。
+- **不做成独立进程**：独立进程拿不到 Electron 的 `net.fetch`，传输层会退化成 Node
+  （指纹这条线白做），而且要再实现一遍账号库/闸门/清理。代价写进 README：**DSH 不跑，接口不在**。
+- **代码默认关、`cordis.patch.yml` 里显式开**：裸 `apply()` 不该凭空多一个监听端口
+  （测试装置大量走这条路，开着的端口会让那些进程永远不退出 —— 全量用例从 40 秒变成
+  每个文件卡满 180 秒超时）；而**装出来的插件**要"填上地址就能用"，所以由装配层打开。
+- **不发 CORS 头 + 只收 `application/json`**：否则任意网页都能用 JS 驱动你的账号。
+  `OPTIONS` 照样回 204，但一个 `Access-Control-Allow-*` 都不给。
+- **首个事件先取出来再决定成败**：未登录 / 限流 / 参数错要用 HTTP 状态码说清楚
+  （503 / 429 + `Retry-After` / 400），一旦先写了 SSE 头就只剩 200，客户端基本不显示错误。
+
+### 测试
+
+- 新增 `tests/check-relay.mjs`（25 条）：请求翻译（消息/工具/推理强度/图片占位）、设置读写与
+  端口收敛、模型列表、非流式与流式的形状、工具调用、失败路径（503 / 429 / 502 / 流中途失败）、
+  key 校验、`text/plain` 被 415 挡掉、OPTIONS 无 CORS 头、端口顺延、重绑开关，
+  以及「删 / 不删开关真的落到了适配器」。
+- 新增 `tests/check-serve.mjs`（7 条）：**起真进程 + 打 HTTP** 验证独立启动器（起得来 / 已在跑就
+  不起第二个 / 配置关着时明确退出 / `--enable` 把开关写回同一份设置 / `--token`、`--login`
+  与 `--token-file` 的坏输入在联网之前就报错 —— 不把垃圾凭证写进账号库）。
+- 真机验证（2026-09-28，用户授权后跑）：`--token-file` 登录 → 账号识别 → 接口监听 →
+  非流式一轮 1.39 秒拿到「可以」（42 入 / 1 出）、思考档的流式帧带 `reasoning_content`；
+  验证用的临时会话按 `sessionCleanup=immediate` 删掉，凭证只落临时目录、跑完即删。
+- 踩坑记录：控制台页面第一版把 `getItem('userToken')` 的引号漏转了义 ⇒ 页面渲染正常、
+  脚本整段语法错误（永远停在"读取中…"），而只查字符串的断言全绿。现在
+  `check-serve.mjs` 会把页面里的 `<script>` 抽出来 `new Function()` **真编译一遍**。
+- 登录这件事被两处现场推着又补了两刀（都是"格式/来源"问题，不是 token 本身）：
+  ① `unwrapStoredToken` 现在会剥掉成对引号，并在"整串不像 token"时抠出**唯一一段** 40+ 位
+  token（现场：用户把 `JSON.parse(localStorage.getItem('userToken')).value）` 这种带中文括号的
+  整句提示复制出来，服务端回 40003，看起来和"过期"一模一样）；
+  ② `loginWithToken` 新增一条**看着就不像 token** 的拦截（含空格/中文/换行直接拒绝并说明
+  "命令本身不是 token，输出才是"）—— 此前这种粘贴会落一条永远校验不过的垃圾账号，
+  用户账号库里因此堆过 3 条 264/396/660 字的记录。
+  控制台账号卡也补齐：取 token 的命令单独一行 + 一键复制按钮 + **「开浏览器窗口登录」（不用 token）**
+  —— 后者走的是既有的 `/login/browser`（真 Edge/Chrome + CDP，独立 profile），
+  所以"不想碰 token"的人也能一点就登。
+- 反向验证逐条实跑：把 tool 结果写成 `assistant` → 消息翻译红；去掉首事件预取 → 未登录 + 限流两条红；
+  流式 delta 的 arguments 错填 `event.name` → 流式那条红；抽掉 `deletesWebSession` 的两个覆盖分支
+  → 删/不删那条红。
+- `check-bundle.mjs` 补 4 条产物断言（路由真的接进 index、落盘文件名、无 CORS、删/不删开关）。
+- 踩到的坑一并记下：同一固定端口上"停一个再起一个"时，客户端连接池里的死连接会让下一条请求
+  拿到 `ECONNRESET`（用例装置改成每条用随机端口即可）；提前回 4xx 前必须 `req.resume()` 排干请求体，
+  否则客户端只看到 `fetch failed` 而不是那条精心写的错误。
+
 ## 0.6.5 — 2026-09-27
 
 > 修复 0.6.3 的重试策略**形状**错误：它会让「按本地退避重试」算出 `NaN`，把整轮打成 UNKNOWN 错误。

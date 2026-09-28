@@ -3,6 +3,8 @@ import { readFileSync } from 'node:fs'
 
 const host = readFileSync('lib/index.js', 'utf8')
 const client = readFileSync('lib/client.js', 'utf8')
+// 独立启动器（用户真正双击的那条路）：它必须指向**产物**，不能指向 src（.ts 在用户机器上跑不起来）
+const serveLauncher = readFileSync('scripts/serve.mjs', 'utf8')
 // 源码（注释不会进 bundle，涉及"注释里必须写明风险"的断言只能读源文件）
 const srcAccounts = readFileSync('src/accounts.ts', 'utf8')
 
@@ -829,6 +831,35 @@ const checks = {
     /browserProfileCleared && partitionOK/.test(host),
   'host 的手动粘贴 token 对「包装 JSON 解出空」fail-closed（不再把 JSON 当 token 落盘）':
     /raw\.startsWith\("\{"\) && !unwrapStoredToken\(token\)/.test(host),
+
+  // ── 0.7.0：本地 OpenAI 兼容接口（给 DSH 之外的软件用）────────────────────
+  // 门面在 api-server.ts，但它是**独立模块** —— 只改源码不接进 index.ts 的话，
+  // 产物里一个字节都不会变（这正是"改了源码没接线"的典型形态），所以断言落在产物上。
+  'host 挂了本地接口的两条 OpenAI 路由（且真的让 adapter 干活，不是另起一套）':
+    host.includes('/v1/chat/completions') &&
+    host.includes('/v1/models') &&
+    /stream: \(opts\) => adapter\.stream\(opts\)/.test(host),
+  'host 的本地接口默认只监听本机、端口设置落盘 api-server.json':
+    host.includes('127.0.0.1') &&
+    host.includes('api-server.json') &&
+    /route === ["']\/api-server["']/.test(host),
+  'host 的本地接口不发 CORS 头 + 只收 application/json（挡掉网页跨站调用）':
+    host.includes('请求体必须是 application/json') &&
+    !host.includes('Access-Control-Allow-Origin'),
+  'host 的单次会话删 / 不删开关（keep_conversation）接到了适配器':
+    /function deletesWebSession/.test(host) &&
+    /__keepSession/.test(host) &&
+    /__deleteSession/.test(host),
+  '独立启动器指向 lib/index.js（不是 src），并且会先探端口再起':
+    serveLauncher.includes("join(ROOT, 'lib', 'index.js')") &&
+    !/from '\.\.\/src\//.test(serveLauncher) &&
+    serveLauncher.includes('/healthz'),
+  'host 启动时把「会话清理=删/不删」打出来（用户最常问的那件事）':
+    host.includes('会话清理=') && host.includes('网页端的临时会话会全部留下'),
+  '本地端口自带控制台页面（一个端口管所有开关）':
+    host.includes('DeepSeek 网页版 · 本地控制台') &&
+    host.includes('console: options.consoleHtml ?') &&
+    host.includes('hostApiHandler'),
 }
 
 let failed = 0

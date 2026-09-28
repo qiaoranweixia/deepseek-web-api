@@ -10,6 +10,30 @@
  * 不依赖 DSH 内部包的可解析性 —— 任何装配路径（注入 / bundle / patch）都能加载。
  */
 import { maskIdentifier, readAuth, refreshVerifiedIdentity, withVerifiedIdentity, writeAuth, type WebAuth } from './auth.ts'
+import {
+  createRelayServer,
+  readRelayConfig,
+  writeRelayConfig,
+  normalizeRelayConfig,
+  relaySettingsPath,
+  DEFAULT_RELAY_PORT,
+  RELAY_PORT_BOUNDS,
+  type RelayConfig,
+} from './api-server.ts'
+import { CONSOLE_HTML } from './console.ts'
+
+/**
+ * 本地接口的配置助手**对外可见**：独立启动器（scripts/serve.mjs）要用它算出"到底开不开、开哪个端口"，
+ * 好让"启动器看到的配置"和"插件内部生效的配置"永远是同一套规则（不是各读一遍文件）。
+ */
+export { normalizeRelayConfig, readRelayConfig, writeRelayConfig, relaySettingsPath } from './api-server.ts'
+
+/**
+ * 手动 token 登录**对外可见**：独立启动器（scripts/serve.mjs --token …）用它在没有 DSH 面板的
+ * 情况下也能把凭证写进账号库。这条路径本来就是纯 Node（校验 = 一次 `users/current` + 落库），
+ * 不碰 Electron —— 所以借出去不会带来"必须开窗"的耦合。
+ */
+export { loginWithToken } from './login.ts'
 import { createRequire } from 'node:module'
 import { readFileSync, statSync } from 'node:fs'
 import { PROVIDER, createAdapter, describeAuth, MODEL_SPECS, type AdapterConfig } from './adapter.ts'
@@ -129,6 +153,17 @@ const IMPORT_FILE_LIMIT_BYTES = 2 * 1024 * 1024
 const API_PREFIX = '/deepseek-web-login/api'
 
 export interface Config extends AdapterConfig {
+  /**
+   * 本地 OpenAI 兼容接口（给 DSH 之外的软件用）。见 api-server.ts 的模块注释。
+   * 优先级与其它设置一致：设置页/文件（api-server.json）> 这里的 cordis config > 内置默认。
+   * 默认**开启**（只监听 127.0.0.1）—— 关掉用 `apiServer: { enabled: false }`。
+   */
+  /**
+   * `force: true` = **本次运行忽略 api-server.json**（端口/开关/key 都以这里的为准）。
+   * 独立启动器的 `--port` 用得到它：文件里的端口优先于 config 是给"设置页是用户显式操作"定的规矩，
+   * 而命令行参数是更显式的那一层 —— 不给这个口子，`--port 8899` 会被文件悄悄盖掉。
+   */
+  apiServer?: Partial<RelayConfig> & { force?: boolean }
   /**
    * 传输层：网页端请求从哪个网络栈出去。
    * `chromium`（默认）＝ Electron 的 `net.fetch`，指纹与真实浏览器一致；`node` ＝ 原来的 undici。
@@ -543,6 +578,16 @@ export function apply(ctx: any, config: Config = {}): void {
     },
     logger,
   })
+  // 把"到底删不删"打到启动日志里：默认是删（攒批），而用户最常问的就是
+  // "为什么网页端只留最新的、能不能都留下" —— 这行让答案就在窗口里，不用翻文档。
+  logger.info?.(
+    `deepseek-web: 会话清理=${cleanupMode}` +
+      (cleanupMode === 'keep'
+        ? '（网页端的临时会话会全部留下，不再删除）'
+        : cleanupMode === 'immediate'
+          ? '（每次调用结束约 1.5 秒后删掉那个临时会话）'
+          : '（攒批集中删；想全留下就把 sessionCleanup 改成 keep）'),
+  )
 
   // ── 「欠删除的会话」落盘 + 启动补删（2026-09-14）────────────────────────────
   //
@@ -676,7 +721,11 @@ export function apply(ctx: any, config: Config = {}): void {
               updateAccount(accountId, {
                 lastVerifyError: {
                   at: new Date().toISOString(),
-                  message: String(info.message ?? '登录态无效，请重新登录'),
+                  // ⚠️ 存**服务端给的短原因**（如 `Authorization Failed (invalid token)`），
+                  // 不要存刚抛出的那条错误全文 —— 那条文案里已经嵌了上一次的 lastVerifyError，
+                  // 于是每失败一次就套一层「这个账号的登录态已失效（这个账号的登录态已失效（…
+                  // （2026-09-28 用户现场：连续几轮之后日志已经没法读了）。
+                  message: String(verdict.error ?? info.message ?? '登录态无效，请重新登录').slice(0, 200),
                 },
               })
               logger.warn?.(
@@ -758,6 +807,68 @@ export function apply(ctx: any, config: Config = {}): void {
   // 1) LLM 适配器：registerAdapter 内部走 ctx.effect（traceable 代理把副作用绑到本 fiber）
   ctx.llm.registerAdapter([PROVIDER], adapter)
   logger.info?.(`deepseek-web: 已注册 provider "${PROVIDER}"（模型：${MODEL_SPECS.map((spec) => spec.id).join(', ')}）`)
+  {
+    // 启动时把"现在用的是哪个账号"打出来。DSH 里是排查用；独立启动器（scripts/serve.mjs）
+    // 更依赖它 —— 那是个黑窗口，用户第一眼要看的就是"到底登着谁"。
+    const summary = describeAuth(readAuth())
+    logger.info?.(
+      summary.loggedIn
+        ? `deepseek-web: 当前账号：${summary.display ?? '（未识别账号）'}${summary.unverified ? '（上次校验未通过，可能已失效）' : ''}`
+        : 'deepseek-web: 当前账号：未登录 —— 先在设置页登录一次（账号 → 浏览器窗口登录），凭证是两处共用的',
+    )
+  }
+
+  // 1b) 本地 OpenAI 兼容接口（api-server.ts）：给 DSH 之外的软件用同一套网页端通道。
+  // 刻意复用**上面这个 adapter 实例** —— 闸门、换号、请求前查失效、会话清理、图片通道
+  // 全都在它里面；另起一条路径等于把这些再实现一遍，且迟早两边行为不一致。
+  /**
+   * 设置接口的实现（在下面 `ctx.webServer.register` 里创建）。本地控制台要用**同一份**，
+   * 而它比 relay 晚创建 ⇒ 存个引用、请求到达时再取。
+   */
+  let hostApiHandler: ((req: any, res: any) => Promise<void>) | undefined
+  const hostApiRef = async (req: any, res: any): Promise<void> => {
+    if (!hostApiHandler) {
+      sendJson(res, 503, { ok: false, error: '设置接口还没就绪（插件正在启动），稍后再试' })
+      return
+    }
+    await hostApiHandler(req, res)
+  }
+  const relay = createRelayServer({
+    stream: (opts: any) => adapter.stream(opts),
+    readBody: (req: any, limit: number) => readJsonBody(req, limit),
+    // 控制台/管理接口：**原样转给下面那套 host API**（ctx.webServer 注册的同一份实现），
+    // 于是"面板里能改的，8788 端口上也能改"，而且不存在两套路由漂移的问题。
+    // hostApi 在这里还没赋值（它在下面注册时才创建），所以用一层惰性转发。
+    admin: (req: any, res: any) => hostApiRef(req, res),
+    consoleHtml: CONSOLE_HTML,
+    config: normalizeRelayConfig({
+      ...(config.apiServer ?? {}),
+      // `force: true`（独立启动器的 --port）⇒ 本次运行不听文件，只听命令行
+      ...(config.apiServer?.force === true ? {} : (readRelayConfig() ?? {})),
+    }),
+    models: MODEL_SPECS,
+    logger,
+  })
+  ctx.effect(
+    () =>
+      void relay
+        .start()
+        .then((port) => {
+          if (port === 0) {
+            logger.info?.('deepseek-web: 本地接口已关闭（apiServer.enabled=false）')
+            return
+          }
+          logger.info?.(
+            `deepseek-web: 本地接口已开启 http://127.0.0.1:${port}/v1 （OpenAI 兼容，` +
+              `模型 ${MODEL_SPECS.map((spec) => spec.id).join(' / ')}；只监听本机）`,
+          )
+        })
+        .catch((error: any) => {
+          // 端口被占满 / 环境不允许监听：只影响这一个功能，绝不能拖垮插件本体
+          logger.warn?.(`deepseek-web: 本地接口启动失败（不影响 DSH 内使用）：${error?.message ?? error}`)
+        }),
+    'dsh-deepseek-web-login: api-server',
+  )
 
   // 2) host API
   ctx.effect(
@@ -765,7 +876,9 @@ export function apply(ctx: any, config: Config = {}): void {
       ctx.webServer.register({
         kind: 'prefix',
         path: API_PREFIX,
-        handler: async (req: any, res: any) => {
+        // ⚠️ 这个赋值是刻意的：本地控制台（上面 hostApiRef）要复用这同一个 handler。
+        // 之所以不去重排这 900 行的缩进，是为了让这次改动只有一行 diff。
+        handler: (hostApiHandler = async (req: any, res: any) => {
           const url = new URL(String(req.url ?? '/'), 'http://127.0.0.1')
           const route = url.pathname.slice(API_PREFIX.length) || '/'
 
@@ -930,6 +1043,95 @@ export function apply(ctx: any, config: Config = {}): void {
               // ⚠️ `cleanup` 必须一起返回：前端保存后立刻重画界面，读不到就回落成默认的
               // 「延迟」档（GET /status 里是有的，两边形状必须一致）。
               sendJson(res, 200, { ok: true, ...applied, persisted: true, cleanup: sessionCleaner.policy() })
+              return
+            }
+            // 本地 OpenAI 兼容接口（api-server.ts）：状态 + 开关。
+            // 保存即重绑（换端口/开关立即生效），落盘走 api-server.json。
+            if (req.method === 'GET' && route === '/api-server') {
+              sendJson(res, 200, {
+                ...relay.config(),
+                running: relay.port > 0,
+                effectivePort: relay.port,
+                defaultPort: DEFAULT_RELAY_PORT,
+                portBounds: RELAY_PORT_BOUNDS,
+                settingsPath: relaySettingsPath(),
+                // 「对话留不留」由会话清理策略决定（同一个清理器），这里回一份方便界面显示
+                sessionCleanup: sessionCleaner.policy().mode,
+              })
+              return
+            }
+            if (req.method === 'POST' && route === '/api-server') {
+              const body = await readJsonBody(req)
+              if (!body || typeof body !== 'object') {
+                sendJson(res, 400, { ok: false, error: '请求体不是合法 JSON' })
+                return
+              }
+              const patch: Partial<RelayConfig> = {}
+              if (body.enabled !== undefined) {
+                if (typeof body.enabled !== 'boolean') {
+                  sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' })
+                  return
+                }
+                patch.enabled = body.enabled
+              }
+              if (body.port !== undefined) {
+                const port = Number(body.port)
+                if (!Number.isFinite(port)) {
+                  sendJson(res, 400, { ok: false, error: 'port 必须是数字' })
+                  return
+                }
+                patch.port = port
+              }
+              if (body.key !== undefined) {
+                if (typeof body.key !== 'string') {
+                  sendJson(res, 400, { ok: false, error: 'key 必须是字符串（留空 = 不校验）' })
+                  return
+                }
+                patch.key = body.key
+              }
+              if (Object.keys(patch).length === 0) {
+                sendJson(res, 400, { ok: false, error: '没有可更新的字段' })
+                return
+              }
+              const next = normalizeRelayConfig(patch, relay.config())
+              let effectivePort = 0
+              try {
+                effectivePort = await relay.reconfigure(next)
+              } catch (error: any) {
+                // 端口占满之类：把**当前**状态如实回给界面，别让面板显示成"已开启"
+                logger.warn?.(`deepseek-web: 本地接口重绑失败：${error?.message ?? error}`)
+                sendJson(res, 200, {
+                  ok: false,
+                  error: `本地接口没能监听 ${next.port}：${error?.message ?? error}`,
+                  config: relay.config(),
+                  running: relay.port > 0,
+                  effectivePort: relay.port,
+                  persisted: false,
+                })
+                return
+              }
+              try {
+                writeRelayConfig(next)
+              } catch (error: any) {
+                logger.warn?.(`deepseek-web: 本地接口设置落盘失败：${error?.message ?? error}`)
+                sendJson(res, 200, {
+                  ok: true,
+                  config: next,
+                  running: effectivePort > 0,
+                  effectivePort,
+                  persisted: false,
+                  warning: '已即时生效，但写入 api-server.json 失败，重启后会回到旧值',
+                })
+                return
+              }
+              sendJson(res, 200, {
+                ok: true,
+                config: next,
+                running: effectivePort > 0,
+                effectivePort,
+                persisted: true,
+                sessionCleanup: sessionCleaner.policy().mode,
+              })
               return
             }
             // 本地调用台账：请求密度 + 失败分类（用来判断节流到底有没有效）
@@ -1652,7 +1854,7 @@ export function apply(ctx: any, config: Config = {}): void {
             logger.warn?.(`deepseek-web api ${route} failed: ${error?.message ?? error}`)
             sendJson(res, 500, { error: error?.message ?? String(error) })
           }
-        },
+        }),
       }),
     'dsh-deepseek-web-login: api',
   )
@@ -1662,6 +1864,10 @@ export function apply(ctx: any, config: Config = {}): void {
   ctx.effect(() => () => {
     try {
       if (isLoginWindowOpen()) closeLoginWindow()
+    } catch {}
+    // 本地接口：先摘掉监听，免得卸载后还占着端口（热重载会立刻重建一个）
+    try {
+      void relay.stop()
     } catch {}
     // 2026-09-14：退出收尾。顺序很重要 ——
     //   ① `disposeSessionReuse()` 把复用槽里的会话**交回它自己的清理回调**（排队待删）。
